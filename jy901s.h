@@ -1,38 +1,57 @@
 #ifndef JY901S_H
 #define JY901S_H
-
-#include "main.h"
+#include <stdbool.h>
+#include <stdio.h>
 #include <string.h>
+#include "ottohesl.h"
+#include "usart.h"
+#include "stm32h7xx_hal.h"
 
-// 传感器数据结构
-typedef struct {
-    float acc[3];     // 加速度 (m/s²) [X, Y, Z]
-    float gyro[3];    // 角速度 (°/s) [X, Y, Z]
-    float angle[3];   // 欧拉角 (°) [Roll, Pitch, Yaw]
-} JY901S_Data;
+/************************ 宏定义 ************************/
+#define Frame_Head         0x55        // 数据帧头
+#define Frame_Accele       0x51        // 加速度数据帧类型
+#define Frame_Gyro         0x52        // 角速度数据帧类型
+#define Frame_Angle        0x53        // 角度数据帧类型
+#define Frame_Magnet       0x54        // 磁场数据帧类型
+#define Frame_Quater       0x59        // 四元数数据帧类型
+#define Frame_Length       11          // 单帧数据长度（字节）
+#define RX_SIZE            256         // DMA接收缓冲区大小
 
-// 解析器状态结构
-typedef struct {
-    uint8_t frame_state;
-    uint8_t byte_count;
-    uint8_t check_sum;
-    uint8_t acc_buffer[8];
-    uint8_t gyro_buffer[8];
-    uint8_t angle_buffer[8];
-} JY901S_Parser;
+/************************ 枚举定义 ************************/
+// JY901S帧解析状态机
+typedef enum Jy901s_FrameState {
+    SEEK_FRAME_HEAD = 0,  // 寻找帧头
+    SEEK_FRAME_TYPE = 1,  // 寻找帧类型
+    SEEK_FRAME_DATA = 2,  // 接收帧数据
+} Frame_State;
 
-// 设备句柄结构
-typedef struct {
-    UART_HandleTypeDef *huart_sensor;
-    UART_HandleTypeDef *huart_debug;
-    JY901S_Data sensor_data;
-    JY901S_Parser parser;
-} JY901S_Handle;
+/************************ 结构体定义 ************************/
+// 陀螺仪核心数据结构体
+typedef struct Jy901s_Gyroscope {
+    float accele[3];      // 加速度(x/y/z)，单位m/s²
+    float gyro[3];        // 角速度(x/y/z)，单位°/s
+    float angle[3];       // 角度(横滚/俯仰/偏航)，单位°
+    float magnet[3];      // 磁场(x/y/z)，单位uT
+    float quaternion[4];  // 四元数(w/x/y/z)
+} JG;
 
-// 函数声明
-void JY901S_Init(JY901S_Handle *handle, UART_HandleTypeDef *sensor_uart, UART_HandleTypeDef *debug_uart);
-void JY901S_ProcessUARTData(JY901S_Handle *handle);
-void JY901S_PrintData(JY901S_Handle *handle);
-void JY901S_ResetParser(JY901S_Handle *handle);
+// JY901S完整数据结构体
+typedef struct Jy901s_Data {
+    JG  gyroscope;        // 陀螺仪参数
+    float temp;           // 温度，单位℃
+} jy901;
 
-#endif // JY901S_H
+/************************ 函数声明 ************************/
+/* 主要函数 */
+void Gyroscope_Init(UART_HandleTypeDef *huart);           // 启动DMA接收陀螺仪数据
+bool Gyroscope_Process();                                 // 解析接收的陀螺仪数据
+/* 数据修改 */
+void Gyroscope_Alter_Bit(UART_HandleTypeDef *huart);      // 修改JY901S波特率
+void Gyroscope_Accele_Calibra(UART_HandleTypeDef *huart); // 加速度计校准
+void Gyroscope_Rrate(UART_HandleTypeDef *huart);          // 配置数据输出速率
+void Gyroscope_Gyro_Calibra(UART_HandleTypeDef *huart);   // 陀螺仪校准
+/* 串口发送 */
+void Gyroscope_Data_Send(jy901 gyro_data,UART_HandleTypeDef *huart);      // 发送解析后的陀螺仪数据
+/************************ 结构声明 ************************/
+extern jy901 gyro_data;
+#endif //JY901S_H
