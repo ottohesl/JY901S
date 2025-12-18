@@ -1,274 +1,359 @@
-#include "jy901s.h"
-#include <stdio.h>
-
-// 内部函数声明
-static void parse_byte(JY901S_Handle *handle, uint8_t byte);
-static void store_data(JY901S_Handle *handle, uint8_t byte);
-static void validate_checksum(JY901S_Handle *handle, uint8_t received_sum);
-static void update_sensor_data(JY901S_Handle *handle);
-static void parse_acceleration(JY901S_Handle *handle);
-static void parse_gyroscope(JY901S_Handle *handle);
-static void parse_angle(JY901S_Handle *handle);
 /**
- * @brief 初始化JY901S传感器
- *
- * 配置传感器句柄并初始化通信接口
- *
- * @param handle 指向JY901S_Handle的指针，包含传感器配置和数据
- * @param sensor_uart 指向传感器UART句柄的指针
- * @param debug_uart 指向调试UART句柄的指针
- *
- * @return 无返回值
+ * @file       JY901S.c
+ * @brief      JY901S陀螺仪驱动实现（串口通信、数据解析、参数配置）
+ * @author     ottohesl
+ * @date       25-12-6
+ * @version    V1.2
+ * @note       适配STM32H7系列，基于HAL库开发，支持DMA接收/解析、参数校准/配置
+ * |************************** 版本更新说明 ******************************|
+ * @note   v1.1     较1.0新增局部陀螺仪结构体私有变量，使得外部可以声明jy901s的结构变量，多元化数据获取。
+ *                  且初始化就可以直接囊括串口句柄和结构体句柄，更加清晰调用
+ *         v1.2     将其结构体变量变为全局变量，无需在外部再添加结构变量，能直接使用头文件声明的结构体变量访问数据
  */
-void JY901S_Init(JY901S_Handle *handle, UART_HandleTypeDef *sensor_uart, UART_HandleTypeDef *debug_uart) {
-    handle->huart_sensor = sensor_uart;
-    handle->huart_debug = debug_uart;
+#include "JY901S.h"
 
-    // 重置传感器数据和解析器
-    memset(&handle->sensor_data, 0, sizeof(JY901S_Data));
-    JY901S_ResetParser(handle);
+/************************ 宏定义 ************************/
+#define G 9.80665f  // 重力加速度常量，单位m/s²
 
-    // 发送初始化成功消息
-    const char *init_msg = "JY901S Init OK\n";
-    HAL_UART_Transmit(handle->huart_debug, (uint8_t*)init_msg, strlen(init_msg), 100);
+/************************ 缓冲区 ************************/
+//stm32h7使用前必看--->>>>>>非h7等高端芯片可直接将下面缓冲数组更改为uint8_t RX[RX_SIZE]
+//开始之前将以下代码粘贴到本文件目录下的_FLASH.ld文件末尾处，并确认RAM区域是0x24000000开始的
+/*
+.sram_msg :
+{
+    . = ALIGN(4);
+    *(.ram) // 匹配代码中的section名
+    } > RAM //映射到0x24000000开始的SRAM
+*/
+uint8_t RX[RX_SIZE] __attribute__((section(".ram"))); // DMA接收缓冲区（迁址到DMA可访问区域）
+/************************ 全局变量 ************************/
+UART_HandleTypeDef *huart_sensor;
+jy901 gyro_data;       // 陀螺仪解析后的数据存储
+/************************ 私有函数声明 ************************/
+static void Gyroscope_Data(const uint8_t *data) ;        // 解析单帧陀螺仪原始数据
+static int16_t Gyroscope_HL_Combine(uint8_t h,uint8_t l); // 高低字节合成16位有符号数
+/**
+ * @brief      修改JY901S串口波特率
+ * @param      huart  串口句柄（对应JY901S连接的串口）
+ * @retval     无
+ * @note       1. 支持9600/115200/230400波特率，默认配置为115200
+ *             2. 修改后需在CubeMX同步修改串口波特率，重新运行函数完成保存
+ *             3. 指令流程：解锁→修改波特率→保存配置
+ */
+void Gyroscope_Alter_Bit(UART_HandleTypeDef *huart) {
+    uint8_t unlock[5]={0xFF,0xAA,0x69,0x88,0xB5};          // 解锁配置指令
+    uint8_t save[5]={0xFF,0xAA,0x00,0x00,0x00};             // 保存配置指令
+    uint8_t change_bit_9600[5]={0xFF,0xAA,0x04,0x02,0x00};  // 配置波特率9600
+    uint8_t change_bit_115200[5]={0xFF,0xAA,0x04,0x06,0x00};// 配置波特率115200
+    uint8_t change_bit_230400[5]={0xFF,0xAA,0x04,0x06,0x00};// 配置波特率230400
+
+    // 解锁配置权限
+    HAL_UART_Transmit(huart,unlock,5,100);
+    HAL_Delay(200);
+    // 发送波特率修改指令（默认115200）
+    HAL_UART_Transmit(huart,change_bit_115200,5,100);
+    HAL_Delay(50);
+    // 保存配置（修改生效）
+    HAL_UART_Transmit(huart,save,5,100);
 }
 
 /**
- * @brief 处理来自传感器的UART数据
- *
- * 从UART接收缓冲区读取所有可用字节并传递给解析器
- *
- * @param handle 指向JY901S_Handle的指针
- *
- * @return 无返回值
+ * @brief      配置JY901S数据输出速率
+ * @param      huart  串口句柄（对应JY901S连接的串口）
+ * @retval     无
+ * @note       1. 支持2/5/10/50/100/200Hz，默认配置为100Hz
+ *             2. 200Hz速率过高可能导致DMA接收不及时，推荐最大100Hz
+ *             3. 指令流程：解锁→修改速率→保存配置
  */
-void JY901S_ProcessUARTData(JY901S_Handle *handle) {
-    uint8_t byte;
-    // 循环读取所有可用数据
-    while (HAL_UART_Receive(handle->huart_sensor, &byte, 1, 60) == HAL_OK) {
-        parse_byte(handle, byte);
+void Gyroscope_Rrate(UART_HandleTypeDef *huart) {
+    uint8_t unlock[5]={0xFF,0xAA,0x69,0x88,0xB5};              // 解锁配置指令
+    uint8_t save[5]={0xFF,0xAA,0x00,0x00,0x00};                 // 保存配置指令
+    uint8_t change_rate_2HZ[5]={0xFF,0xAA,0x03,0x03,0x00};      // 配置输出速率2Hz
+    uint8_t change_rate_5HZ[5]={0xFF,0xAA,0x03,0x05,0x00};      // 配置输出速率5Hz
+    uint8_t change_rate_10HZ[5]={0xFF,0xAA,0x03,0x06,0x00};     // 配置输出速率10Hz
+    uint8_t change_rate_50HZ[5]={0xFF,0xAA,0x03,0x08,0x00};     // 配置输出速率50Hz
+    uint8_t change_rate_100HZ[5]={0xFF,0xAA,0x03,0x09,0x00};    // 配置输出速率100Hz
+    uint8_t change_rate_200HZ[5]={0xFF,0xAA,0x03,0x0B,0x00};    // 配置输出速率200Hz
+
+    // 解锁配置权限
+    HAL_UART_Transmit(huart,unlock,5,100);
+    HAL_Delay(200);
+    // 发送速率修改指令（默认100Hz）
+    HAL_UART_Transmit(huart,change_rate_100HZ,5,100);
+    HAL_Delay(100);
+    // 保存配置（修改生效）
+    HAL_UART_Transmit(huart,save,5,100);
+}
+
+/**
+ * @brief      执行JY901S加速度计校准
+ * @param      huart  串口句柄（对应JY901S连接的串口）
+ * @retval     无
+ * @note       1. 校准过程需保持陀螺仪静止，水平放置
+ *             2. 指令流程：解锁→启动校准→延时4s（校准过程）→退出校准→保存配置
+ *             3. 4秒延时为校准预留时间，不可缩短
+ */
+void Gyroscope_Accele_Calibra(UART_HandleTypeDef *huart) {
+    uint8_t unlock[5]={0xFF,0xAA,0x69,0x88,0xB5};              // 解锁配置指令
+    uint8_t save[5]={0xFF,0xAA,0x00,0x00,0x00};                 // 保存配置指令
+    uint8_t change_data[5]={0xFF,0xAA,0x01,0x01,0x00};          // 启动加速度校准指令
+    uint8_t exit_change_data[5]={0xFF,0xAA,0x01,0x00,0x00};     // 退出加速度校准指令
+
+    // 解锁配置权限
+    HAL_UART_Transmit(huart,unlock,5,100);
+    HAL_Delay(200);
+    // 启动加速度计校准
+    HAL_UART_Transmit(huart,change_data,5,100);
+    HAL_Delay(4000); // 校准耗时4秒，保持设备静止
+    // 退出校准模式
+    HAL_UART_Transmit(huart,exit_change_data,5,100);
+    HAL_Delay(100);
+    // 保存校准结果
+    HAL_UART_Transmit(huart,save,5,100);
+}
+
+/**
+ * @brief      执行JY901S陀螺仪校准
+ * @param      huart  串口句柄（对应JY901S连接的串口）
+ * @retval     无
+ * @note       1. 校准过程需保持陀螺仪静止，水平放置
+ *             2. 指令流程：解锁→启动校准→延时3s（校准过程）→退出校准→保存配置
+ *             3. 3秒延时为校准预留时间，不可缩短
+ */
+void Gyroscope_Gyro_Calibra(UART_HandleTypeDef *huart) {
+    uint8_t unlock[5]={0xFF,0xAA,0x69,0x88,0xB5};              // 解锁配置指令
+    uint8_t save[5]={0xFF,0xAA,0x00,0x00,0x00};                 // 保存配置指令
+    uint8_t change_data[5]={0xFF,0xAA,0x61,0x00,0x00};          // 启动陀螺仪校准指令
+    uint8_t exit_change_data[5]={0xFF,0xAA,0x61,0x01,0x00};     // 退出陀螺仪校准指令
+
+    // 解锁配置权限
+    HAL_UART_Transmit(huart,unlock,5,100);
+    HAL_Delay(200);
+    // 启动陀螺仪校准
+    HAL_UART_Transmit(huart,change_data,5,100);
+    HAL_Delay(3000); // 校准耗时3秒，保持设备静止
+    // 退出校准模式
+    HAL_UART_Transmit(huart,exit_change_data,5,100);
+    HAL_Delay(100);
+    // 保存校准结果
+    HAL_UART_Transmit(huart,save,5,100);
+}
+
+/**
+ * @brief      启动JY901S DMA接收
+ * @param      huart  串口句柄（对应JY901S连接的串口）
+ * @retval     无
+ * @note       1. 基于HAL库DMA接收接口，缓冲区为全局数组RX[RX_SIZE]
+ *             2. 需确保RX缓冲区迁址到STM32H7 DMA可访问区域（0x24000000后）
+ *             3. 调用一次即可持续DMA接收，无需重复调用
+ */
+void Gyroscope_Init(UART_HandleTypeDef *huart) {
+    huart_sensor = huart;
+    HAL_UART_Receive_DMA(huart,RX,RX_SIZE);//一定要开启dma循环模式
+}
+
+/**
+ * @brief      解析JY901S DMA接收的原始数据
+ * @retval     bool  - true：解析到有效数据；false：无有效数据
+ * @note       1. 采用状态机解析帧头→帧类型→帧数据，带超时/校验保护
+ *             2. 解析前关闭全局中断，防止DMA缓冲区数据污染
+ *             3. 支持多帧连续解析，校验和错误帧自动丢弃
+ */
+bool Gyroscope_Process() {
+    bool Available_Data = false;               // 有效数据标志
+    uint32_t DMA_Received_Index = 0;           // DMA当前接收位置
+    uint32_t DMA_Received_Length = 0;          // 本次待解析数据长度
+    static uint8_t byte_pos = 0;               // 帧数据字节偏移
+    static uint8_t checksum = 0;               // 帧校验和
+    static uint16_t frame_timeout = 0;         // 帧解析超时计数器
+    static const uint8_t TIMEOUT = 100;        // 帧解析超时阈值
+    static uint8_t RX_Process[Frame_Length];   // 单帧数据临时缓冲区
+    static uint32_t DMA_Received_Index_Last = 0;// 上一次解析位置
+    static Frame_State frame_state = SEEK_FRAME_HEAD; // 帧解析状态机
+
+    // 关闭全局中断，防止DMA缓冲区数据被篡改
+    __disable_irq();
+    // 获取DMA当前接收位置（剩余字节数反算已接收位置）
+    DMA_Received_Index= RX_SIZE - __HAL_DMA_GET_COUNTER(huart_sensor->hdmarx);
+    // 计算本次待解析的数据长度（处理缓冲区环形溢出）
+    if (DMA_Received_Index>=DMA_Received_Index_Last) {
+        DMA_Received_Length=DMA_Received_Index-DMA_Received_Index_Last;
+    } else {
+        DMA_Received_Length=RX_SIZE+DMA_Received_Index-DMA_Received_Index_Last;
     }
-}
+    // 恢复全局中断
+    __enable_irq();
 
-/**
- * @brief 打印传感器数据到调试串口
- *
- * 以固定频率输出传感器角度数据
- *
- * @param handle 指向JY901S_Handle的指针
- *
- * @return 无返回值
- */
-void JY901S_PrintData(JY901S_Handle *handle) {
-    // 每500ms打印一次数据
-    char buffer[75];
-    int len1=sprintf(buffer, " %.2f, %.2f, %.2f\n",
-                  handle->sensor_data.angle[0],
-                  handle->sensor_data.angle[1],
-                  handle->sensor_data.angle[2]);
-    HAL_UART_Transmit(handle->huart_debug, (uint8_t*)buffer, len1, 100);
-}
-/**
- * @brief 重置解析器状态
- *
- * 将解析器状态恢复到初始状态，准备接收新的数据帧
- *
- * @param handle 指向JY901S_Handle的指针
- *
- * @return 无返回值
- */
-void JY901S_ResetParser(JY901S_Handle *handle) {
-    handle->parser.frame_state = 0;
-    handle->parser.byte_count = 0;
-    handle->parser.check_sum = 0;
-}
+    // 有新数据时执行解析
+    if (DMA_Received_Length>0) {
+        for (uint32_t i=0;i<DMA_Received_Length;i++) {
+            // 环形缓冲区取数，避免越界
+            uint32_t byte=RX[(DMA_Received_Index_Last+i)%RX_SIZE];
+            frame_timeout++; // 超时计数器递增
 
-/**
- * @brief 解析单个字节数据
- *
- * 根据当前解析状态处理接收到的字节，实现帧同步和数据提取
- *
- * @param handle 指向JY901S_Handle的指针
- * @param byte 接收到的单个字节数据
- *
- * @return 无返回值
- */
-static void parse_byte(JY901S_Handle *handle, uint8_t byte) {
-    JY901S_Parser *parser = &handle->parser;
-
-    switch (parser->frame_state) {
-        case 0: // 等待帧头
-            if (byte == 0x55 && parser->byte_count == 0) {
-                parser->check_sum = byte;
-                parser->byte_count = 1;
+            // 帧解析超时保护：重置状态机
+            if (frame_timeout>TIMEOUT) {
+                checksum=0;
+                byte_pos=0;
+                frame_timeout=0;
+                frame_state=SEEK_FRAME_HEAD;
+                continue;
             }
-            break;
 
-        case 1: // 接收加速度数据
-        case 2: // 接收陀螺仪数据
-        case 3: // 接收角度数据
-            if (parser->byte_count < 10) {
-                store_data(handle, byte);
-                parser->check_sum += byte;
-                parser->byte_count++;
-            } else {
-                validate_checksum(handle, byte);
-                JY901S_ResetParser(handle);
+            // 帧解析状态机
+            switch (frame_state) {
+                case SEEK_FRAME_HEAD: // 寻找帧头0x55
+                    if (byte==Frame_Head) {
+                        RX_Process[byte_pos++]=byte;
+                        checksum=byte;
+                        frame_timeout=0;
+                        frame_state=SEEK_FRAME_TYPE;
+                    }
+                    break;
+
+                case SEEK_FRAME_TYPE: // 寻找有效帧类型
+                    if ((byte>=Frame_Accele&&byte<=Frame_Magnet) || byte==Frame_Quater) {
+                        RX_Process[byte_pos++]=byte;
+                        checksum+=byte;
+                        frame_state=SEEK_FRAME_DATA;
+                    } else {
+                        // 无效帧类型，重置状态机
+                        byte_pos=0;
+                        checksum = 0;
+                        frame_state=SEEK_FRAME_HEAD;
+                    }
+                    break;
+
+                case SEEK_FRAME_DATA: // 接收帧数据并校验
+                    RX_Process[byte_pos++]=byte;
+                    if (byte_pos < Frame_Length) {
+                        checksum += byte; // 累加校验和
+                    }
+                    // 单帧数据接收完成
+                    if (byte_pos>=Frame_Length) {
+                        // 校验和匹配：解析数据
+                        if ((checksum&0xFF) == RX_Process[10]) {
+                            Gyroscope_Data(RX_Process);
+                            Available_Data= true;
+                        }
+                        // 重置状态机，准备解析下一帧
+                        byte_pos=0;
+                        checksum=0;
+                        frame_timeout=0;
+                        frame_state=SEEK_FRAME_HEAD;
+                    }
+                    break;
             }
-            break;
-
-        default: // 无效状态
-            JY901S_ResetParser(handle);
+        }
     }
-
-    // 状态转移
-    if (parser->byte_count == 1 && (byte >= 0x51 && byte <= 0x53)) {
-        parser->check_sum += byte;
-        parser->frame_state = byte - 0x50;
-        parser->byte_count = 2;
-    }
+    // 更新上一次解析位置
+    DMA_Received_Index_Last=DMA_Received_Index;
+    return Available_Data;
 }
 
 /**
- * @brief 存储接收到的数据
- *
- * 根据当前帧类型将数据存储到对应的缓冲区
- *
- * @param handle 指向JY901S_Handle的指针
- * @param byte 接收到的单个字节数据
- *
- * @return 无返回值
+ * @brief      解析单帧JY901S原始数据，转换为物理量
+ * @param      data  单帧原始数据（长度=Frame_Length=11字节）
+ * @retval     无
+ * @note       1. 根据帧类型分别解析加速度/角速度/角度/磁场/四元数
+ *             2. 原始数据为16位有符号数，需转换为物理量（带单位）
+ *             3. 温度数据随加速度帧一并解析
  */
-static void store_data(JY901S_Handle *handle, uint8_t byte) {
-    JY901S_Parser *parser = &handle->parser;
-    uint8_t index = parser->byte_count - 2;
-
-    if (index >= 8) return;  // 防止缓冲区溢出
-
-    switch (parser->frame_state) {
-        case 1:
-            parser->acc_buffer[index] = byte;
+static void Gyroscope_Data(const uint8_t *data) {
+    switch (data[1]) {
+        case Frame_Accele: // 加速度+温度帧
+            gyro_data.gyroscope.accele[0] = (float)Gyroscope_HL_Combine(data[3],data[2])/32768.0f * 16.0f * G;
+            gyro_data.gyroscope.accele[1] = (float)Gyroscope_HL_Combine(data[5],data[4])/32768.0f * 16.0f * G;
+            gyro_data.gyroscope.accele[2] = (float)Gyroscope_HL_Combine(data[7],data[6])/32768.0f * 16.0f * G;
+            gyro_data.temp = (float)Gyroscope_HL_Combine(data[9],data[8])/100.0f;
             break;
-        case 2:
-            parser->gyro_buffer[index] = byte;
-            break;
-        case 3:
-            parser->angle_buffer[index] = byte;
-            break;
-    }
-}
 
-/**
- * @brief 验证校验和
- *
- * 比较计算的校验和与接收到的校验和是否一致
- *
- * @param handle 指向JY901S_Handle的指针
- * @param received_sum 接收到的校验和字节
- *
- * @return 无返回值
- */
-static void validate_checksum(JY901S_Handle *handle, uint8_t received_sum) {
-    JY901S_Parser *parser = &handle->parser;
-
-    if ((parser->check_sum & 0xFF) == received_sum) {
-        update_sensor_data(handle);
-    }
-}
-
-/**
- * @brief 更新传感器数据
- *
- * 根据帧类型调用相应的解析函数处理数据
- *
- * @param handle 指向JY901S_Handle的指针
- *
- * @return 无返回值
- */
-static void update_sensor_data(JY901S_Handle *handle) {
-    switch (handle->parser.frame_state) {
-        case 1:
-            parse_acceleration(handle);
+        case Frame_Gyro: // 角速度帧
+            gyro_data.gyroscope.gyro[0] = (float)Gyroscope_HL_Combine(data[3],data[2])/32768.0f * 2000;
+            gyro_data.gyroscope.gyro[1] = (float)Gyroscope_HL_Combine(data[5],data[4])/32768.0f * 2000;
+            gyro_data.gyroscope.gyro[2] = (float)Gyroscope_HL_Combine(data[7],data[6])/32768.0f * 2000;
             break;
-        case 2:
-            parse_gyroscope(handle);
+
+        case Frame_Angle: // 角度帧
+            gyro_data.gyroscope.angle[0] = (float)Gyroscope_HL_Combine(data[3],data[2])/32768.0f * 180.0f;
+            gyro_data.gyroscope.angle[1] = (float)Gyroscope_HL_Combine(data[5],data[4])/32768.0f * 180.0f;
+            gyro_data.gyroscope.angle[2] = (float)Gyroscope_HL_Combine(data[7],data[6])/32768.0f * 180.0f;
             break;
-        case 3:
-            parse_angle(handle);
+
+        case Frame_Magnet: // 磁场帧
+            gyro_data.gyroscope.magnet[0] = (float)Gyroscope_HL_Combine(data[3],data[2])/150.0f;
+            gyro_data.gyroscope.magnet[1] = (float)Gyroscope_HL_Combine(data[5],data[4])/150.0f;
+            gyro_data.gyroscope.magnet[2] = (float)Gyroscope_HL_Combine(data[7],data[6])/150.0f;
+            break;
+
+        case Frame_Quater: // 四元数帧
+            gyro_data.gyroscope.quaternion[0] = (float)Gyroscope_HL_Combine(data[3],data[2])/32768.0f;
+            gyro_data.gyroscope.quaternion[1] = (float)Gyroscope_HL_Combine(data[5],data[4])/32768.0f;
+            gyro_data.gyroscope.quaternion[2] = (float)Gyroscope_HL_Combine(data[7],data[6])/32768.0f;
+            gyro_data.gyroscope.quaternion[3] = (float)Gyroscope_HL_Combine(data[9],data[8])/32768.0f;
+            break;
+
+        default:
             break;
     }
 }
 
 /**
- * @brief 解析加速度数据
- *
- * 将原始加速度数据转换为实际物理值(m/s²)
- *
- * @param handle 指向JY901S_Handle的指针
- *
- * @return 无返回值
+ * @brief      高低字节合成16位有符号整数
+ * @param      h  高8位字节
+ * @param      l  低8位字节
+ * @retval     int16_t  合成后的16位有符号数
+ * @note       JY901S所有数据均为低字节在前、高字节在后，需按此规则合成
  */
-static void parse_acceleration(JY901S_Handle *handle) {
-    JY901S_Parser *parser = &handle->parser;
-    JY901S_Data *data = &handle->sensor_data;
-
-    int16_t rawX = (int16_t)((parser->acc_buffer[1] << 8) | parser->acc_buffer[0]);
-    int16_t rawY = (int16_t)((parser->acc_buffer[3] << 8) | parser->acc_buffer[2]);
-    int16_t rawZ = (int16_t)((parser->acc_buffer[5] << 8) | parser->acc_buffer[4]);
-
-    const float scale = 16.0f * 9.80665f; // 转换为m/s²
-    data->acc[0] = (float)rawX / 32768.0f * scale;
-    data->acc[1] = (float)rawY / 32768.0f * scale;
-    data->acc[2] = (float)rawZ / 32768.0f * scale;
+static int16_t Gyroscope_HL_Combine(uint8_t h,uint8_t l) {
+    return (int16_t)((uint16_t)h << 8 | l);
 }
 
 /**
- * @brief 解析陀螺仪数据
- *
- * 将原始陀螺仪数据转换为实际物理值(°/s)
- *
- * @param handle 指向JY901S_Handle的指针
- *
- * @return 无返回值
+ * @brief      发送解析后的陀螺仪数据（格式化输出）-----参考函数
+ * @param      huart  串口句柄（用于数据发送的串口）
+ * @retval     无
+ * @note       1. 数据格式化为易读字符串，包含单位说明
+ *             2. 当前为注释状态，可根据需求启用HAL_UART_Transmit发送
+ *             3. 支持加速度/角速度/角度/温度/磁场/四元数全量发送
  */
-static void parse_gyroscope(JY901S_Handle *handle) {
-    JY901S_Parser *parser = &handle->parser;
-    JY901S_Data *data = &handle->sensor_data;
+void Gyroscope_Data_Send(UART_HandleTypeDef *huart) {
+    const static int size=100; // 字符串缓冲区大小
+    char Send_Date_accle[size];  // 加速度数据字符串
+    char Send_Date_gyro[size];   // 角速度数据字符串
+    char Send_Date_angle[size];  // 角度数据字符串
+    char Send_Date_temp[size];   // 温度数据字符串
+    char Send_Date_Magnet[size]; // 磁场数据字符串
+    char Send_Date_Quater[size]; // 四元数数据字符串
+    ottohesl_uart(huart,"%.2f,%.2f,%.2f",gyro_data.gyroscope.angle[0],gyro_data.gyroscope.angle[1],gyro_data.gyroscope.angle[2]);
+    // 格式化加速度数据
+    int len_accle=sprintf(Send_Date_accle,"x加速度: %.2f，y加速度: %.2f，z加速度: %.2f\n",
+        gyro_data.gyroscope.accele[0],gyro_data.gyroscope.accele[1],gyro_data.gyroscope.accele[2]);
 
-    int16_t rawX = (int16_t)((parser->gyro_buffer[1] << 8) | parser->gyro_buffer[0]);
-    int16_t rawY = (int16_t)((parser->gyro_buffer[3] << 8) | parser->gyro_buffer[2]);
-    int16_t rawZ = (int16_t)((parser->gyro_buffer[5] << 8) | parser->gyro_buffer[4]);
+    // 格式化角速度数据）
+    int len_gyro=sprintf(Send_Date_gyro,"x角速度: %.2f，y角速度: %.2f，z角速度: %.2f\n",
+        gyro_data.gyroscope.gyro[0],gyro_data.gyroscope.gyro[1],gyro_data.gyroscope.gyro[2]);
 
-    const float scale = 2000.0f; // 量程±2000°/s
-    data->gyro[0] = (float)rawX / 32768.0f * scale;
-    data->gyro[1] = (float)rawY / 32768.0f * scale;
-    data->gyro[2] = (float)rawZ / 32768.0f * scale;
-}
+    // 格式化角度数据
+    int len_angle=sprintf(Send_Date_angle,"翻滚角: %.2f，俯仰角: %.2f，航偏角: %.2f\n",
+        gyro_data.gyroscope.angle[0],gyro_data.gyroscope.angle[1],gyro_data.gyroscope.angle[2]);
 
-/**
- * @brief 解析角度数据
- *
- * 将原始角度数据转换为实际角度值(°)，并将Yaw转换为0-360°范围
- *
- * @param handle 指向JY901S_Handle的指针
- *
- * @return 无返回值
- */
-static void parse_angle(JY901S_Handle *handle) {
-    JY901S_Parser *parser = &handle->parser;
-    JY901S_Data *data = &handle->sensor_data;
+    // 格式化温度数据
+    int len_temp=sprintf(Send_Date_temp,"温度: %.2f\n",gyro_data.temp);
 
-    int16_t rawRoll = (int16_t)((parser->angle_buffer[1] << 8) | parser->angle_buffer[0]);
-    int16_t rawPitch = (int16_t)((parser->angle_buffer[3] << 8) | parser->angle_buffer[2]);
-    int16_t rawYaw = (int16_t)((parser->angle_buffer[5] << 8) | parser->angle_buffer[4]);
+    // 格式化磁场数据
+    int len_magent=sprintf(Send_Date_Magnet,"x磁: %.2f，y磁: %.2f，z磁: %.2f\n",
+        gyro_data.gyroscope.magnet[0],gyro_data.gyroscope.magnet[1],gyro_data.gyroscope.magnet[2]);
 
-    const float scale = 180.0f; // 量程±180°
-    data->angle[0] = (float)rawRoll / 32768.0f * scale;  // Roll
-    data->angle[1] = (float)rawPitch / 32768.0f * scale; // Pitch
-    data->angle[2] = (float)rawYaw / 32768.0f * scale;   // Yaw
+    // 格式化四元数数据
+    int len_Quater=sprintf(Send_Date_Quater,"w: %.2f，x: %.2f，y: %.2f，z: %.2f\n",
+        gyro_data.gyroscope.quaternion[0],gyro_data.gyroscope.quaternion[1],gyro_data.gyroscope.quaternion[2],gyro_data.gyroscope.quaternion[3]);
 
-    // 将Yaw转换为0-360°
-    if (data->angle[2] < 0) {
-        data->angle[2] += 360.0f;
-    }
+    // 启用以下代码可发送对应数据
+    // HAL_UART_Transmit(huart,(uint8_t *)Send_Date_accle,len_accle,100);
+    // HAL_UART_Transmit(huart,(uint8_t *)Send_Date_gyro,len_gyro,100);
+    //HAL_UART_Transmit(huart,(uint8_t *)Send_Date_angle,len_angle,100);
+    // HAL_UART_Transmit(huart,(uint8_t *)Send_Date_temp,len_temp,100);
+    // HAL_UART_Transmit(huart,(uint8_t *)Send_Date_Magnet,len_magent,100);
+    // HAL_UART_Transmit(huart,(uint8_t *)Send_Date_Quater,len_Quater,100);
 }
