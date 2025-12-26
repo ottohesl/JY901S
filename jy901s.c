@@ -3,7 +3,7 @@
  * @brief      JY901S陀螺仪驱动实现（串口通信、数据解析、参数配置）
  * @author     ottohesl----zhujijun
  * @date       25-12-6
- * @version    V1.2
+ * @version    V1.4
  * @note       适配STM32F1/F4/H7系列，基于HAL库开发，支持DMA接收/解析、参数校准/配置
  * |************************** 版本更新说明 ******************************|
  * @note   v1.1     较1.0新增局部陀螺仪结构体私有变量，使得外部可以声明jy901s的结构变量，多元化数据获取。
@@ -402,3 +402,4 @@ void Gyroscope_Data_Send(UART_HandleTypeDef *huart) {
     // HAL_UART_Transmit(huart,(uint8_t *)Send_Date_Magnet,len_magent,100);
     // HAL_UART_Transmit(huart,(uint8_t *)Send_Date_Quater,len_Quater,100);
 }
+
