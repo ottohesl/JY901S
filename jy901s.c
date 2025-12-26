@@ -1,22 +1,31 @@
 /**
  * @file       JY901S.c
  * @brief      JY901S陀螺仪驱动实现（串口通信、数据解析、参数配置）
- * @author     ottohesl
+ * @author     ottohesl----zhujijun
  * @date       25-12-6
  * @version    V1.2
- * @note       适配STM32H7系列，基于HAL库开发，支持DMA接收/解析、参数校准/配置
+ * @note       适配STM32F1/F4/H7系列，基于HAL库开发，支持DMA接收/解析、参数校准/配置
  * |************************** 版本更新说明 ******************************|
  * @note   v1.1     较1.0新增局部陀螺仪结构体私有变量，使得外部可以声明jy901s的结构变量，多元化数据获取。
  *                  且初始化就可以直接囊括串口句柄和结构体句柄，更加清晰调用
  *         v1.2     将其结构体变量变为全局变量，无需在外部再添加结构变量，能直接使用头文件声明的结构体变量访问数据
+ *         v1.3     添加预处理命令，使用文件前在头文件处将JY901S_H_Vision的版本改到你芯片所处版本即可
+ *                  添加预处理命令，使用文件前在头文件将OTTOHELS文件进行包含管理
+ *         v1.4     添加预处理命令，可以进行串口debug寻找具体错误原因
  */
 #include "JY901S.h"
 
 /************************ 宏定义 ************************/
 #define G 9.80665f  // 重力加速度常量，单位m/s²
 
+/********************** 调试模式开关 *********************/
+#define DEBUG_MODE 1       //1开启，0关闭
+
+/********************** 调试最大限制 *********************/
+#define DEBUG_WIDTH 20
+
 /************************ 缓冲区 ************************/
-//stm32h7使用前必看--->>>>>>非h7等高端芯片可直接将下面缓冲数组更改为uint8_t RX[RX_SIZE]
+//stm32h7使用前必看--->>>>>>非h7等高端芯片可直接更改版本号
 //开始之前将以下代码粘贴到本文件目录下的_FLASH.ld文件末尾处，并确认RAM区域是0x24000000开始的
 /*
 .sram_msg :
@@ -25,9 +34,14 @@
     *(.ram) // 匹配代码中的section名
     } > RAM //映射到0x24000000开始的SRAM
 */
+#if JY901S_H_Vision==7
 uint8_t RX[RX_SIZE] __attribute__((section(".ram"))); // DMA接收缓冲区（迁址到DMA可访问区域）
+#else
+uint8_t RX[RX_SIZE];
+#endif
 /************************ 全局变量 ************************/
 UART_HandleTypeDef *huart_sensor;
+UART_HandleTypeDef *huart_debugs;
 jy901 gyro_data;       // 陀螺仪解析后的数据存储
 /************************ 私有函数声明 ************************/
 static void Gyroscope_Data(const uint8_t *data) ;        // 解析单帧陀螺仪原始数据
@@ -141,20 +155,40 @@ void Gyroscope_Gyro_Calibra(UART_HandleTypeDef *huart) {
 
 /**
  * @brief      启动JY901S DMA接收
- * @param      huart  串口句柄（对应JY901S连接的串口）
+ * @param      h_senor  串口句柄（对应JY901S连接的串口）
+ * @param      h_debug  调试句柄（调试所需发送到的串口）
  * @retval     无
  * @note       1. 基于HAL库DMA接收接口，缓冲区为全局数组RX[RX_SIZE]
  *             2. 需确保RX缓冲区迁址到STM32H7 DMA可访问区域（0x24000000后）
  *             3. 调用一次即可持续DMA接收，无需重复调用
  */
-void Gyroscope_Init(UART_HandleTypeDef *huart) {
-    huart_sensor = huart;
-    HAL_UART_Receive_DMA(huart,RX,RX_SIZE);//一定要开启dma循环模式
+void Gyroscope_Init(UART_HandleTypeDef *h_senor,UART_HandleTypeDef *h_debug) {
+    huart_sensor = h_senor;
+    huart_debugs = h_debug;
+    HAL_StatusTypeDef Check_Error=HAL_UART_Receive_DMA(huart_sensor,RX,RX_SIZE);//一定要开启dma循环模式
+#if DEBUG_MODE
+    if (Check_Error!=HAL_OK) {
+        ottohesl_uart(huart_debugs,"串口接受初始化错误");
+    }
+    if (h_senor->hdmarx->State!=HAL_DMA_STATE_READY) {
+        ottohesl_uart(huart_debugs,"串口接受DMA未就绪，稍等");
+        if(h_senor->hdmatx->State==HAL_DMA_STATE_RESET) {
+            ottohesl_uart(huart_debugs,"DMA没有初始化");
+        }else if (h_senor->hdmatx->State==HAL_DMA_STATE_BUSY) {
+            ottohesl_uart(huart_debugs,"DMA忙碌中");
+        }else if (h_senor->hdmatx->State==HAL_DMA_STATE_ERROR) {
+            ottohesl_uart(huart_debugs,"DMA出错");
+        }else if (h_senor->hdmatx->State==HAL_DMA_STATE_ABORT) {
+            ottohesl_uart(huart_debugs,"DMA传输错误");
+        }
+    }
+    #endif
 }
 
 /**
  * @brief      解析JY901S DMA接收的原始数据
  * @retval     bool  - true：解析到有效数据；false：无有效数据
+ * @note        预处理命令调试模式说明:在连续n次循环中，
  * @note       1. 采用状态机解析帧头→帧类型→帧数据，带超时/校验保护
  *             2. 解析前关闭全局中断，防止DMA缓冲区数据污染
  *             3. 支持多帧连续解析，校验和错误帧自动丢弃
@@ -183,7 +217,18 @@ bool Gyroscope_Process() {
     }
     // 恢复全局中断
     __enable_irq();
-
+#if DEBUG_MODE
+    static int error_count = 0;
+    static uint32_t DMA_Received_Length_Debug = 0;
+    //前者条件判断当前是否读取到新数据；后者条件判断是否下一次产生新数据，没有新数据则相减>=0，有新数据为负数，表明为有效数据
+    if ((DMA_Received_Length==0)&&((DMA_Received_Length_Debug-DMA_Received_Length) >= 0)) error_count++;
+    else error_count=0;
+    if (error_count>DEBUG_WIDTH) {
+        error_count=0;
+        ottohesl_uart(huart_debugs,"原始数据错误：未收集到任何数据！");
+    }
+    DMA_Received_Length_Debug = DMA_Received_Length;
+#endif
     // 有新数据时执行解析
     if (DMA_Received_Length>0) {
         for (uint32_t i=0;i<DMA_Received_Length;i++) {
